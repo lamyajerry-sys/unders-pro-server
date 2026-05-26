@@ -1,0 +1,11 @@
+services:
+  - type: web
+    name: unders-pro-server
+    env: node
+    buildCommand: npm install
+    startCommand: npm start
+    envVars:
+      - key: API_KEY
+        value: ec9a38adc2d89cdf3b9a699a346b9ee6
+      - key: PORT
+        value: 3000

@@ -1,0 +1,18 @@
+{
+  "name": "unders-pro-server",
+  "version": "1.0.0",
+  "description": "Backend proxy for Unders Pro betting bot",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node server.js"
+  },
+  "dependencies": {
+    "express": "^4.18.2",
+    "node-fetch": "^2.7.0",
+    "cors": "^2.8.5"
+  },
+  "engines": {
+    "node": ">=16"
+  }
+}
