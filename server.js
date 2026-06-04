@@ -7,8 +7,34 @@ const PORT = process.env.PORT || 3000;
 const API_KEY = process.env.API_KEY || '';
 const HOST = 'v3.football.api-sports.io';
 
+// Telegram — set these as env vars in Render
+const TG_TOKEN = process.env.TG_TOKEN || '';
+const TG_CHAT = process.env.TG_CHAT || '';
+
 app.use(cors());
 app.use(express.json());
+
+// Send a Telegram message (silently no-ops if not configured)
+async function sendTelegram(text) {
+  if (!TG_TOKEN || !TG_CHAT) return { ok: false, reason: 'not configured' };
+  try {
+    const res = await fetch(`https://api.telegram.org/bot${TG_TOKEN}/sendMessage`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        chat_id: TG_CHAT,
+        text,
+        parse_mode: 'HTML',
+        disable_web_page_preview: true,
+      }),
+    });
+    const d = await res.json();
+    return { ok: d.ok === true, result: d };
+  } catch(e) {
+    console.error('Telegram error:', e.message);
+    return { ok: false, reason: e.message };
+  }
+}
 
 // Cache
 const cache = new Map();
@@ -21,6 +47,22 @@ function setCache(k, d) { cache.set(k, { data: d, ts: Date.now() }); }
 
 // Rate limiter — Pro plan allows 300/min. We cap at 250 for safety headroom.
 const RATE_MAX = parseInt(process.env.RATE_MAX || '250', 10);
+// ── Daily budget guard ──
+// Pro = 7500/day. Cap server auto-scanner at 6500, leaving ~1000 for manual.
+const DAILY_BUDGET = parseInt(process.env.DAILY_BUDGET || '6500', 10);
+let callsToday = 0;
+let budgetDay = new Date().toISOString().split('T')[0];
+function trackCall() {
+  const today = new Date().toISOString().split('T')[0];
+  if (today !== budgetDay) { budgetDay = today; callsToday = 0; }  // reset at UTC midnight
+  callsToday++;
+}
+function budgetLeft() {
+  const today = new Date().toISOString().split('T')[0];
+  if (today !== budgetDay) { budgetDay = today; callsToday = 0; }
+  return DAILY_BUDGET - callsToday;
+}
+
 const times = [];
 async function call(endpoint) {
   const now = Date.now();
@@ -31,6 +73,7 @@ async function call(endpoint) {
     await new Promise(r => setTimeout(r, wait));
   }
   times.push(Date.now());
+  trackCall();
   const res = await fetch(`https://${HOST}${endpoint}`, {
     headers: { 'x-apisports-key': API_KEY }
   });
@@ -64,17 +107,12 @@ app.get('/upcoming', async (req, res) => {
   } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
-app.get('/research', async (req, res) => {
-  try {
-    const { homeId, awayId, leagueId, fixtureId } = req.query;
-    if (!homeId || !awayId || !leagueId || !fixtureId)
-      return res.status(400).json({ error: 'homeId, awayId, leagueId, fixtureId required' });
+async function doResearch(homeId, awayId, leagueId, fixtureId) {
+  const k = `r_${fixtureId}`;
+  const cached = getCached(k, 90);  // 90s — live stats change fast
+  if (cached) return { source: 'cache', ...cached };
 
-    const k = `r_${fixtureId}`;
-    const cached = getCached(k, 90);  // 90s — live stats change fast
-    if (cached) return res.json({ source: 'cache', ...cached });
-
-    const season = new Date().getFullYear();
+  const season = new Date().getFullYear();
 
     // Pro plan — fire all calls in parallel for speed
     const [h2hRaw, homeSt, awaySt, lineups, odds, statsRaw, eventsRaw] = await Promise.all([
@@ -239,14 +277,246 @@ app.get('/research', async (req, res) => {
 
     setCache(k, result);
     console.log(`Research ${fixtureId}: xG=${result.model.xG} H2H=${h2hTotal}g pressure=${pressure} liveXg=${liveXgTotal}`);
-    res.json({ source:'api', ...result });
+    return { source:'api', ...result };
+}
+
+app.get('/research', async (req, res) => {
+  try {
+    const { homeId, awayId, leagueId, fixtureId } = req.query;
+    if (!homeId || !awayId || !leagueId || !fixtureId)
+      return res.status(400).json({ error: 'homeId, awayId, leagueId, fixtureId required' });
+    const result = await doResearch(homeId, awayId, leagueId, fixtureId);
+    res.json(result);
   } catch(e) {
     console.error('Research error:', e.message);
     res.status(500).json({ error: e.message });
   }
 });
 
+// ── TELEGRAM ──
+// Test endpoint — visit in browser to confirm setup
+app.get('/tg-test', async (req, res) => {
+  const r = await sendTelegram('✅ <b>Unders Pro connected!</b>\nYou will now get alerts here when picks fire.');
+  res.json({ configured: !!(TG_TOKEN && TG_CHAT), sent: r.ok, detail: r.reason || 'sent' });
+});
+
+// Notify endpoint — bot POSTs a pick, server forwards to Telegram
+// De-dupes so the same pick isn't sent twice
+const tgSent = new Set();
+app.post('/notify', async (req, res) => {
+  try {
+    const p = req.body || {};
+    if (!p.fixtureId || !p.market) return res.status(400).json({ error: 'missing fields' });
+
+    const dedupeKey = `${p.fixtureId}_${p.market}`;
+    if (tgSent.has(dedupeKey)) return res.json({ ok: true, skipped: 'already sent' });
+    tgSent.add(dedupeKey);
+    // Clear dedupe set every 30 min so re-alerts can fire later
+    if (tgSent.size > 200) tgSent.clear();
+
+    const edgeLine = p.edge ? `\n📊 Edge: <b>+${p.edge}%</b> (model ${p.edgeModel}% vs bookie ${p.edgeBookie}%)` : '';
+    const pressureLine = (p.pressure !== null && p.pressure !== undefined)
+      ? `\n⚡ Live pressure: <b>${p.pressure}/100</b>` : '';
+    const kellyLine = p.kellyStake ? `\n💰 Suggested stake: <b>$${p.kellyStake}</b>` : '';
+
+    const msg =
+      `🎯 <b>UNDERS PICK — Grade ${p.grade}</b>\n\n` +
+      `<b>${p.home} vs ${p.away}</b>\n` +
+      `${p.league}\n` +
+      `⏱ ${p.minute}' | Score ${p.homeGoals}:${p.awayGoals}\n\n` +
+      `⬇ <b>${p.market}</b> @ <b>${p.odds}</b>\n` +
+      `Confidence: <b>${p.score}%</b>${edgeLine}${pressureLine}${kellyLine}\n\n` +
+      `<i>Always 2 goals to bust. Place manually on your bookie.</i>`;
+
+    const r = await sendTelegram(msg);
+    res.json({ ok: r.ok });
+  } catch(e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ════════════════════════════════════════════
+// AUTONOMOUS SCANNER
+// Runs server-side during active hours, sends
+// Telegram alerts hands-free. Budget-capped.
+// ════════════════════════════════════════════
+const SCAN = {
+  enabled: (process.env.AUTO_SCAN || 'true') === 'true',
+  startHour: parseInt(process.env.ACTIVE_START || '14', 10),  // CAT hours
+  endHour: parseInt(process.env.ACTIVE_END || '23', 10),
+  tzOffset: parseInt(process.env.TZ_OFFSET || '2', 10),       // CAT = UTC+2
+  minMin: 60, maxMin: 75,
+  minScore: 55, minEdge: 3, maxPressure: 55,
+  bankroll: parseFloat(process.env.BANKROLL || '100'),
+};
+const autoSent = new Set();
+
+function catHour() {
+  const utc = new Date();
+  return (utc.getUTCHours() + SCAN.tzOffset) % 24;
+}
+function inActiveHours() {
+  const h = catHour();
+  return SCAN.startHour <= SCAN.endHour
+    ? (h >= SCAN.startHour && h < SCAN.endHour)
+    : (h >= SCAN.startHour || h < SCAN.endHour);
+}
+
+const LG = {'Serie A':7,'Ligue 1':6,'La Liga':5,'Premier League':2,'Bundesliga':-7,'Eredivisie':-6,'Botola':9,'Serie B':8,'NB II':6,'SuperLiga':3};
+function lgAdj(name){for(const k in LG){if((name||'').includes(k))return LG[k];}return 0;}
+function fact(n){return n<=1?1:n*fact(n-1);}
+
+function evaluate(g, r) {
+  const total = g.homeGoals + g.awayGoals;
+  const tl = 90 - g.minute;
+  let market, ob;
+  if(total===0){market='Under 2.5';ob=1.55;}
+  else if(total===1){market='Under 2.5';ob=1.65;}
+  else if(total===2){market='Under 3.5';ob=1.45;}
+  else if(total===3){market='Under 4.5';ob=1.28;}
+  else if(total===4){market='Under 5.5';ob=1.16;}
+  else if(total===5){market='Under 6.5';ob=1.10;}
+  else return null;
+
+  const realOdds = r.liveOdds?.[market] || null;
+  const finalOdds = realOdds ? +realOdds.toFixed(3) : Math.max(1.05, +(ob-(1-tl/30)*0.05).toFixed(3));
+  if (finalOdds < 1.08) return null;
+
+  // Goals that BUST each line (floor+1). Under 4.5 busts at 5 goals.
+  const lineMap={'Under 2.5':3,'Under 3.5':4,'Under 4.5':5,'Under 5.5':6,'Under 6.5':7};
+  const gn = lineMap[market] - total;
+  const rate = (r.model?.xG||2.2)*(tl/90);
+  let mp=0; for(let k=0;k<gn;k++) mp+=(Math.pow(rate,k)*Math.exp(-rate))/fact(k);
+  const h2hR = total<=1?(r.h2h?.u25Rate||.5):total<=2?(r.h2h?.u35Rate||.6):(r.h2h?.u45Rate||.72);
+  const blend = mp*.55 + h2hR*.45;
+  const bp = realOdds ? 1/realOdds : 1/ob;
+  const edge = +((blend-bp)*100).toFixed(1);
+  const hasEdge = edge >= SCAN.minEdge;
+  if (realOdds && !hasEdge) return null;
+
+  let score = 65;
+  if(h2hR>=.75)score+=14; else if(h2hR>=.55)score+=6; else score-=12;
+  const h2hAvg=r.h2h?.avgGoals||2.5;
+  if(h2hAvg<=1.8)score+=11; else if(h2hAvg<=2.5)score+=4; else score-=9;
+  const hf=r.home?.avgFor||1.3, af=r.away?.avgFor||1.1;
+  if(hf<=1.0)score+=8; else if(hf>=2.0)score-=7;
+  if(af<=0.9)score+=8; else if(af>=1.8)score-=7;
+  if((r.home?.csRate||0)>=.35)score+=6;
+  if((r.away?.csRate||0)>=.30)score+=5;
+  const xG=r.model?.xG||2.2;
+  if(xG<=1.8)score+=9; else if(xG>=2.8)score-=8; else score+=3;
+  if(hasEdge)score+=11;
+  if(r.model?.bothDefensive)score+=8;
+
+  const lv=r.live;
+  if(lv&&lv.available){
+    if(lv.pressure>=SCAN.maxPressure)score-=14;
+    else if(lv.pressure>=35)score-=5;
+    else score+=10;
+    if(lv.liveXgTotal>0){
+      if(lv.liveXgTotal < total-0.8)score+=6;
+      else if(lv.liveXgTotal > total+1.0)score-=8;
+    }
+    if(lv.redCards>0)score+=8;
+    if(lv.recentGoalCount>=2)score-=6;
+  }
+  if(tl<=20)score+=6;
+  if(g.homeGoals!==g.awayGoals)score+=4;
+  score += lgAdj(g.leagueName);
+  score = Math.max(30, Math.min(97, score));
+
+  if(score < SCAN.minScore) return null;
+  if(lv&&lv.available&&lv.pressure>=75) return null;
+
+  const grade = score>=82?'A':score>=68?'B':'C';
+  let kelly=0;
+  if(hasEdge&&finalOdds>1){
+    const b=finalOdds-1, p=blend, q=1-p;
+    kelly=+(SCAN.bankroll*Math.max(0,(b*p-q)/b)*0.5).toFixed(2);
+  }
+  return { market, odds:finalOdds, score, grade, edge, hasEdge,
+    edgeModel:(blend*100).toFixed(0), edgeBookie:(bp*100).toFixed(0),
+    pressure:lv?.pressure??null, kellyStake:kelly };
+}
+
+async function autoScan() {
+  if (!SCAN.enabled) return;
+  if (!inActiveHours()) return;
+  if (budgetLeft() < 100) { console.log('Budget nearly exhausted, skipping scan'); return; }
+
+  try {
+    const live = await call('/fixtures?live=all');
+    const inWindow = live.filter(f => {
+      const m = f.fixture?.status?.elapsed || 0;
+      const s = f.fixture?.status?.short || '';
+      return ['1H','2H','ET','BT','P','INT'].includes(s) && m >= SCAN.minMin && m <= SCAN.maxMin;
+    });
+
+    if (inWindow.length) console.log(`AutoScan: ${inWindow.length} in window | budget left: ${budgetLeft()}`);
+
+    for (const f of inWindow) {
+      if (budgetLeft() < 50) break;  // hard stop near budget limit
+      const g = {
+        id: f.fixture.id,
+        home: f.teams.home.name, away: f.teams.away.name,
+        homeGoals: f.goals?.home ?? 0, awayGoals: f.goals?.away ?? 0,
+        minute: f.fixture.status.elapsed || 0,
+        leagueName: f.league?.name || '',
+        league: `${f.league?.name||''} ${f.league?.country||''}`,
+      };
+      const dedupe = `${g.id}_${g.homeGoals+g.awayGoals}`;
+      if (autoSent.has(dedupe)) continue;
+
+      const r = await doResearch(f.teams.home.id, f.teams.away.id, f.league.id, f.fixture.id);
+      const ev = evaluate(g, r);
+      if (!ev) continue;
+
+      autoSent.add(dedupe);
+      if (autoSent.size > 300) autoSent.clear();
+
+      const edgeLine = ev.edge ? `\n📊 Edge: <b>+${ev.edge}%</b>` : '';
+      const pressLine = ev.pressure!==null ? `\n⚡ Pressure: <b>${ev.pressure}/100</b>` : '';
+      const kellyLine = ev.kellyStake ? `\n💰 Stake: <b>$${ev.kellyStake}</b>` : '';
+      await sendTelegram(
+        `🎯 <b>AUTO PICK — Grade ${ev.grade}</b>\n\n` +
+        `<b>${g.home} vs ${g.away}</b>\n${g.league}\n` +
+        `⏱ ${g.minute}' | Score ${g.homeGoals}:${g.awayGoals}\n\n` +
+        `⬇ <b>${ev.market}</b> @ <b>${ev.odds}</b>\n` +
+        `Confidence: <b>${ev.score}%</b>${edgeLine}${pressLine}${kellyLine}\n\n` +
+        `<i>Always 2 goals to bust. Place manually.</i>`
+      );
+      console.log(`AUTO ALERT: ${g.home} vs ${g.away} | ${ev.market} @ ${ev.odds} | ${ev.score}%`);
+    }
+  } catch(e) {
+    console.error('AutoScan error:', e.message);
+  }
+}
+
+// Status endpoint — check scanner state and budget
+app.get('/status', (req, res) => {
+  res.json({
+    autoScan: SCAN.enabled,
+    activeNow: inActiveHours(),
+    catHour: catHour(),
+    activeHours: `${SCAN.startHour}:00–${SCAN.endHour}:00 CAT`,
+    callsToday,
+    budgetLeft: budgetLeft(),
+    dailyBudget: DAILY_BUDGET,
+  });
+});
+
 app.listen(PORT, () => {
   console.log(`✅ Unders Pro Server on port ${PORT}`);
-  console.log(`🔑 Key: ${API_KEY ? API_KEY.slice(0,8)+'...' : 'NOT SET — add API_KEY env var'}`);
+  console.log(`🔑 Key: ${API_KEY ? API_KEY.slice(0,8)+'...' : 'NOT SET'}`);
+  console.log(`📲 Telegram: ${TG_TOKEN && TG_CHAT ? 'configured' : 'not set'}`);
+  console.log(`🤖 Auto-scan: ${SCAN.enabled ? `ON (${SCAN.startHour}-${SCAN.endHour} CAT, budget ${DAILY_BUDGET})` : 'OFF'}`);
+
+  // Adaptive scan loop: every 60s in active hours, checks budget itself
+  if (SCAN.enabled) {
+    setInterval(autoScan, 60000);
+    // Keep-alive ping to stop Render free tier sleeping during active hours
+    setInterval(() => {
+      if (inActiveHours()) console.log(`Heartbeat | CAT ${catHour()}:00 | budget ${budgetLeft()}`);
+    }, 5 * 60000);
+  }
 });
