@@ -347,6 +347,8 @@ const SCAN = {
   tzOffset: parseInt(process.env.TZ_OFFSET || '2', 10),       // CAT = UTC+2
   minMin: 60, maxMin: 75,
   minScore: 55, minEdge: 3, maxPressure: 55,
+  minOdds: parseFloat(process.env.MIN_ODDS || '1.30'),
+  maxOdds: parseFloat(process.env.MAX_ODDS || '2.50'),
   bankroll: parseFloat(process.env.BANKROLL || '100'),
 };
 const autoSent = new Set();
@@ -380,7 +382,7 @@ function evaluate(g, r) {
 
   const realOdds = r.liveOdds?.[market] || null;
   const finalOdds = realOdds ? +realOdds.toFixed(3) : Math.max(1.05, +(ob-(1-tl/30)*0.05).toFixed(3));
-  if (finalOdds < 1.08) return null;
+  if (finalOdds < SCAN.minOdds || finalOdds > SCAN.maxOdds) return null;
 
   // Goals that BUST each line (floor+1). Under 4.5 busts at 5 goals.
   const lineMap={'Under 2.5':3,'Under 3.5':4,'Under 4.5':5,'Under 5.5':6,'Under 6.5':7};
