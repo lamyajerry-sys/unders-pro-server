@@ -213,19 +213,29 @@ async function doResearch(homeId, awayId, leagueId, fixtureId) {
         corners:       getStat(aStat, 'Corner Kicks'),
         xg:            parseFloat((aStat?.statistics?.find(x=>(x.type||'').toLowerCase()==='expected_goals')?.value)||0),
       },
-      available: !!(hStat && aStat),
+      available: false,  // set below after checking for real data
     };
+    // A stats response can come back as two empty team objects for leagues
+    // without live-stats coverage. Only treat as "available" if there's REAL data.
+    const totalStatsSignal =
+      (liveStats.home.shotsTotal + liveStats.away.shotsTotal) +
+      (liveStats.home.attacks + liveStats.away.attacks) +
+      (liveStats.home.dangerAttacks + liveStats.away.dangerAttacks) +
+      (liveStats.home.possession + liveStats.away.possession);
+    liveStats.available = !!(hStat && aStat) && totalStatsSignal > 0;
 
-    // ── LIVE EVENTS — red cards, recent goals ──
+    // ── LIVE EVENTS — red cards, recent goals, subs ──
     const events = eventsRaw || [];
     const goals = events.filter(e => e.type === 'Goal');
     const redCards = events.filter(e => e.type === 'Card' && (e.detail||'').includes('Red'));
     const recentGoals = goals.filter(e => (e.time?.elapsed||0) >= 45); // 2nd half goals
     const lastGoalMin = goals.length ? Math.max(...goals.map(e => e.time?.elapsed||0)) : 0;
+    const eventsAvailable = events.length > 0;
+    // Goals in the last ~15 min = game is currently open/end-to-end
+    const veryRecentGoals = goals.filter(e => (e.time?.elapsed||0) >= 55).length;
+    const subs = events.filter(e => e.type === 'subst').length;
 
     // ── PRESSURE / MOMENTUM SCORE ──
-    // Combines live attacking threat into one number (0-100)
-    // High pressure = next goal likely = BAD for under
     const totalShotsOnGoal = liveStats.home.shotsOnGoal + liveStats.away.shotsOnGoal;
     const totalDangerAttacks = liveStats.home.dangerAttacks + liveStats.away.dangerAttacks;
     const totalShots = liveStats.home.shotsTotal + liveStats.away.shotsTotal;
@@ -233,17 +243,31 @@ async function doResearch(homeId, awayId, leagueId, fixtureId) {
 
     // Pressure index — higher means more goal threat right now
     let pressure = 0;
+    let pressureSource = 'none';
     if (liveStats.available) {
+      // FULL pressure — real shot/attack data (covered leagues)
       pressure = Math.min(100, Math.round(
         (totalShotsOnGoal * 6) +
         (totalDangerAttacks * 0.4) +
         (totalShots * 1.5) +
         (recentGoals.length * 8)
       ));
+      pressureSource = 'full';
+    } else if (eventsAvailable) {
+      // PARTIAL pressure — events only (lower leagues without stats coverage)
+      // Recent goals are the strongest live signal that a game is opening up.
+      pressure = Math.min(100, Math.round(
+        (veryRecentGoals * 30) +     // a goal in last ~35min = strong open-game signal
+        (recentGoals.length * 12)    // 2nd-half goals generally
+      ));
+      pressureSource = 'events';
     }
 
     const liveAnalysis = {
-      available: liveStats.available,
+      available: liveStats.available,           // true only when FULL shot/attack stats present
+      eventsAvailable,                          // true when at least events are present
+      pressureSource,                           // 'full' | 'events' | 'none'
+      hasAnyLiveData: pressureSource !== 'none',
       pressure,                       // 0-100, lower is better for under
       totalShotsOnGoal,
       totalDangerAttacks,
@@ -301,22 +325,24 @@ app.get('/tg-test', async (req, res) => {
 });
 
 // Notify endpoint — bot POSTs a pick, server forwards to Telegram
-// De-dupes so the same pick isn't sent twice
-const tgSent = new Set();
+// Shares ONE dedup set with the auto-scanner so the same pick is never
+// sent twice even if both the bot and the server scanner catch it.
+const sentAlerts = new Set();
+function alertKey(fixtureId, market) { return `${fixtureId}_${market}`; }
 app.post('/notify', async (req, res) => {
   try {
     const p = req.body || {};
     if (!p.fixtureId || !p.market) return res.status(400).json({ error: 'missing fields' });
 
-    const dedupeKey = `${p.fixtureId}_${p.market}`;
-    if (tgSent.has(dedupeKey)) return res.json({ ok: true, skipped: 'already sent' });
-    tgSent.add(dedupeKey);
-    // Clear dedupe set every 30 min so re-alerts can fire later
-    if (tgSent.size > 200) tgSent.clear();
+    const dedupeKey = alertKey(p.fixtureId, p.market);
+    if (sentAlerts.has(dedupeKey)) return res.json({ ok: true, skipped: 'already sent' });
+    sentAlerts.add(dedupeKey);
+    if (sentAlerts.size > 300) sentAlerts.clear();
 
     const edgeLine = p.edge ? `\n📊 Edge: <b>+${p.edge}%</b> (model ${p.edgeModel}% vs bookie ${p.edgeBookie}%)` : '';
     const pressureLine = (p.pressure !== null && p.pressure !== undefined)
-      ? `\n⚡ Live pressure: <b>${p.pressure}/100</b>` : '';
+      ? `\n⚡ Live pressure: <b>${p.pressure}/100</b>`
+      : `\n⚠️ No live stats — pre-match analysis only`;
     const kellyLine = p.kellyStake ? `\n💰 Suggested stake: <b>$${p.kellyStake}</b>` : '';
 
     const msg =
@@ -325,6 +351,7 @@ app.post('/notify', async (req, res) => {
       `${p.league}\n` +
       `⏱ ${p.minute}' | Score ${p.homeGoals}:${p.awayGoals}\n\n` +
       `⬇ <b>${p.market}</b> @ <b>${p.odds}</b>\n` +
+      (p.reason ? `💡 <b>Why:</b> ${p.reason}\n` : '') +
       `Confidence: <b>${p.score}%</b>${edgeLine}${pressureLine}${kellyLine}\n\n` +
       `<i>Always 2 goals to bust. Place manually on your bookie.</i>`;
 
@@ -351,7 +378,6 @@ const SCAN = {
   maxOdds: parseFloat(process.env.MAX_ODDS || '2.50'),
   bankroll: parseFloat(process.env.BANKROLL || '100'),
 };
-const autoSent = new Set();
 
 function catHour() {
   const utc = new Date();
@@ -412,6 +438,7 @@ function evaluate(g, r) {
 
   const lv=r.live;
   if(lv&&lv.available){
+    // FULL live stats — strongest signal
     if(lv.pressure>=SCAN.maxPressure)score-=14;
     else if(lv.pressure>=35)score-=5;
     else score+=10;
@@ -421,6 +448,13 @@ function evaluate(g, r) {
     }
     if(lv.redCards>0)score+=8;
     if(lv.recentGoalCount>=2)score-=6;
+  } else if(lv&&lv.pressureSource==='events'){
+    // PARTIAL — events only. Lighter weight since it's less complete.
+    if(lv.pressure>=50)score-=10;       // recent goals = game opening up
+    else if(lv.pressure>=25)score-=4;
+    else score+=4;                       // quiet on events = mild positive
+    if(lv.redCards>0)score+=8;
+    if(lv.recentGoalCount>=2)score-=6;
   }
   if(tl<=20)score+=6;
   if(g.homeGoals!==g.awayGoals)score+=4;
@@ -428,17 +462,52 @@ function evaluate(g, r) {
   score = Math.max(30, Math.min(97, score));
 
   if(score < SCAN.minScore) return null;
-  if(lv&&lv.available&&lv.pressure>=75) return null;
+  if(lv&&lv.available&&lv.pressure>=75) return null;   // hard skip only on FULL data
+  // Hard skip when a game is ACTIVELY opening up — overrides strong pre-match stats.
+  // 2+ second-half goals OR very high live pressure means the game is end-to-end now.
+  if(lv&&lv.hasAnyLiveData&&(lv.recentGoalCount>=2||(lv.pressureSource==='events'&&lv.pressure>=60))) return null;
 
   const grade = score>=82?'A':score>=68?'B':'C';
   let kelly=0;
   if(hasEdge&&finalOdds>1){
     const b=finalOdds-1, p=blend, q=1-p;
-    kelly=+(SCAN.bankroll*Math.max(0,(b*p-q)/b)*0.5).toFixed(2);
+    const halfKelly=SCAN.bankroll*Math.max(0,(b*p-q)/b)*0.5;
+    const hardCap=SCAN.bankroll*0.05; // never more than 5% on a single bet
+    kelly=+Math.min(halfKelly,hardCap).toFixed(2);
   }
+
+  // ── PLAIN-ENGLISH REASON ──
+  // Build a short one-liner from the strongest factors that made this a pick.
+  const bits = [];
+  if(h2hR>=.75) bits.push(`${r.h2h?.u35||'most'}/${r.h2h?.total||'10'} past meetings went under`);
+  else if(h2hR>=.55) bits.push('decent under record between these teams');
+  if(h2hAvg<=1.8) bits.push(`they average just ${h2hAvg} goals head-to-head`);
+  if(hf<=1.0 && af<=0.9) bits.push('both teams score very little');
+  else if(hf<=1.0) bits.push(`${g.home} barely scores at home`);
+  else if(af<=0.9) bits.push(`${g.away} barely scores away`);
+  if(xG<=1.8) bits.push(`low expected goals (${xG})`);
+  if(hasEdge) bits.push(`bookie odds give +${edge}% value`);
+  if(r.model?.bothDefensive) bits.push('both set up defensively');
+  if(lv&&lv.available&&lv.pressure<35) bits.push('game is quiet right now');
+  if(lv&&lv.redCards>0) bits.push('a red card should slow the game');
+  if(tl<=20) bits.push(`only ${tl} mins left`);
+  if(lgAdj(g.leagueName)>=7) bits.push('low-scoring league');
+
+  // Take the 3 strongest, make a sentence
+  let reason;
+  if(bits.length){
+    reason = bits.slice(0,3).join(', ');
+    reason = reason.charAt(0).toUpperCase() + reason.slice(1) + '.';
+  } else {
+    reason = `Scoreline gives a 2-goal safety buffer with ${tl} mins left.`;
+  }
+
   return { market, odds:finalOdds, score, grade, edge, hasEdge,
     edgeModel:(blend*100).toFixed(0), edgeBookie:(bp*100).toFixed(0),
-    pressure:lv?.pressure??null, kellyStake:kelly };
+    pressure: (lv && lv.hasAnyLiveData) ? lv.pressure : null,
+    pressureSource: lv ? lv.pressureSource : 'none',
+    reason,
+    kellyStake:kelly };
 }
 
 async function autoScan() {
@@ -466,24 +535,30 @@ async function autoScan() {
         leagueName: f.league?.name || '',
         league: `${f.league?.name||''} ${f.league?.country||''}`,
       };
-      const dedupe = `${g.id}_${g.homeGoals+g.awayGoals}`;
-      if (autoSent.has(dedupe)) continue;
 
       const r = await doResearch(f.teams.home.id, f.teams.away.id, f.league.id, f.fixture.id);
       const ev = evaluate(g, r);
       if (!ev) continue;
 
-      autoSent.add(dedupe);
-      if (autoSent.size > 300) autoSent.clear();
+      // Shared dedup with /notify — won't double-send if bot already alerted
+      const dedupe = alertKey(g.id, ev.market);
+      if (sentAlerts.has(dedupe)) continue;
+      sentAlerts.add(dedupe);
+      if (sentAlerts.size > 300) sentAlerts.clear();
 
       const edgeLine = ev.edge ? `\n📊 Edge: <b>+${ev.edge}%</b>` : '';
-      const pressLine = ev.pressure!==null ? `\n⚡ Pressure: <b>${ev.pressure}/100</b>` : '';
+      const pressLine = ev.pressureSource === 'full'
+        ? `\n⚡ Live pressure: <b>${ev.pressure}/100</b>`
+        : ev.pressureSource === 'events'
+        ? `\n⚡ Live pressure: <b>${ev.pressure}/100</b> (events only — no full stats)`
+        : `\n⚠️ No live data — pre-match analysis only`;
       const kellyLine = ev.kellyStake ? `\n💰 Stake: <b>$${ev.kellyStake}</b>` : '';
       await sendTelegram(
         `🎯 <b>AUTO PICK — Grade ${ev.grade}</b>\n\n` +
         `<b>${g.home} vs ${g.away}</b>\n${g.league}\n` +
         `⏱ ${g.minute}' | Score ${g.homeGoals}:${g.awayGoals}\n\n` +
         `⬇ <b>${ev.market}</b> @ <b>${ev.odds}</b>\n` +
+        `💡 <b>Why:</b> ${ev.reason}\n` +
         `Confidence: <b>${ev.score}%</b>${edgeLine}${pressLine}${kellyLine}\n\n` +
         `<i>Always 2 goals to bust. Place manually.</i>`
       );
