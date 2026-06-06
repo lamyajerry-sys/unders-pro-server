@@ -410,6 +410,44 @@ function evaluate(g, r) {
   const finalOdds = realOdds ? +realOdds.toFixed(3) : Math.max(1.05, +(ob-(1-tl/30)*0.05).toFixed(3));
   if (finalOdds < SCAN.minOdds || finalOdds > SCAN.maxOdds) return null;
 
+  // ════════════════════════════════════════════
+  // HARD VETOES — absolute blocks on high-scoring situations.
+  // These fire BEFORE scoring, so no amount of other positives
+  // can sneak a high-scoring matchup through.
+  // ════════════════════════════════════════════
+  const h2hAvgGoals = r.h2h?.avgGoals ?? null;
+  const h2hCount = r.h2h?.total || 0;
+  const homeFor = r.home?.avgFor ?? 1.3;
+  const awayFor = r.away?.avgFor ?? 1.1;
+  const combinedXG = r.model?.xG ?? 2.2;
+
+  // 1. H2H history is high-scoring → these teams score against each other
+  if (h2hCount >= 3 && h2hAvgGoals !== null && h2hAvgGoals >= 3.0) {
+    console.log(`VETO ${g.home} v ${g.away}: H2H avg ${h2hAvgGoals}g too high`);
+    return null;
+  }
+  // 2. Either team is a high-scoring side this season
+  if (homeFor >= 2.0 || awayFor >= 2.0) {
+    console.log(`VETO ${g.home} v ${g.away}: high-scoring team (${homeFor}/${awayFor})`);
+    return null;
+  }
+  // 3. Combined attacking output too high
+  if ((homeFor + awayFor) >= 3.2) {
+    console.log(`VETO ${g.home} v ${g.away}: combined attack ${(homeFor+awayFor).toFixed(1)} too high`);
+    return null;
+  }
+  // 4. Model expected goals too high
+  if (combinedXG >= 3.0) {
+    console.log(`VETO ${g.home} v ${g.away}: xG ${combinedXG} too high`);
+    return null;
+  }
+  // 5. Thin H2H sample → require real meetings, don't bet on assumptions
+  //    (only enforced when we have NO live data to lean on instead)
+  if (h2hCount < 3 && !(r.live && r.live.hasAnyLiveData)) {
+    console.log(`VETO ${g.home} v ${g.away}: only ${h2hCount} H2H meetings, no live data`);
+    return null;
+  }
+
   // Goals that BUST each line (floor+1). Under 4.5 busts at 5 goals.
   const lineMap={'Under 2.5':3,'Under 3.5':4,'Under 4.5':5,'Under 5.5':6,'Under 6.5':7};
   const gn = lineMap[market] - total;
@@ -427,12 +465,12 @@ function evaluate(g, r) {
   const h2hAvg=r.h2h?.avgGoals||2.5;
   if(h2hAvg<=1.8)score+=11; else if(h2hAvg<=2.5)score+=4; else score-=9;
   const hf=r.home?.avgFor||1.3, af=r.away?.avgFor||1.1;
-  if(hf<=1.0)score+=8; else if(hf>=2.0)score-=7;
-  if(af<=0.9)score+=8; else if(af>=1.8)score-=7;
+  if(hf<=1.0)score+=8; else if(hf>=1.7)score-=10;
+  if(af<=0.9)score+=8; else if(af>=1.6)score-=10;
   if((r.home?.csRate||0)>=.35)score+=6;
   if((r.away?.csRate||0)>=.30)score+=5;
   const xG=r.model?.xG||2.2;
-  if(xG<=1.8)score+=9; else if(xG>=2.8)score-=8; else score+=3;
+  if(xG<=1.8)score+=9; else if(xG>=2.5)score-=12; else score+=3;
   if(hasEdge)score+=11;
   if(r.model?.bothDefensive)score+=8;
 
