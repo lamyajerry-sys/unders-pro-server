@@ -279,11 +279,18 @@ async function doResearch(homeId, awayId, leagueId, fixtureId) {
       lastGoalMin,
     };
 
+    // ── H2H rates with shrinkage toward a neutral prior ──
+    // A single meeting that went under should NOT read as 100%. We pull small
+    // samples toward a sensible baseline so 1 game can't fake a strong signal.
+    // shrunk = (under + K*prior) / (total + K).  K=4 = needs ~4 games to trust fully.
+    const K = 4;
+    const shrink = (under, total, prior) => +(((under||0) + K*prior) / ((total||0) + K)).toFixed(2);
+
     const result = {
       h2h: { total:h2hTotal, avgGoals:h2hAvg, u25, u35, u45,
-        u25Rate:h2hTotal?+(u25/h2hTotal).toFixed(2):0.45,
-        u35Rate:h2hTotal?+(u35/h2hTotal).toFixed(2):0.60,
-        u45Rate:h2hTotal?+(u45/h2hTotal).toFixed(2):0.75,
+        u25Rate: shrink(u25, h2hTotal, 0.45),
+        u35Rate: shrink(u35, h2hTotal, 0.60),
+        u45Rate: shrink(u45, h2hTotal, 0.75),
         last5 },
       home: { avgFor:+homeFor.toFixed(2), avgAgainst:+homeAgainst.toFixed(2),
         form:homeForm, csRate:homeCS, winRate:homeWin,
@@ -334,6 +341,15 @@ app.post('/notify', async (req, res) => {
     const p = req.body || {};
     if (!p.fixtureId || !p.market) return res.status(400).json({ error: 'missing fields' });
 
+    // Best-of-best gate — same strict bar as the auto-scanner.
+    const gate = passesTelegramGate(
+      { score:p.score||0, hasEdge:p.hasEdge, h2hCount:p.h2hCount??0,
+        h2hAvgGoals:(p.h2hAvgGoals===undefined?null:p.h2hAvgGoals),
+        homeFor:p.homeFor??9, awayFor:p.awayFor??9 },
+      { home:p.home||'', away:p.away||'' }
+    );
+    if (!gate) return res.json({ ok: true, skipped: 'below best-of-best bar' });
+
     const dedupeKey = alertKey(p.fixtureId, p.market);
     if (sentAlerts.has(dedupeKey)) return res.json({ ok: true, skipped: 'already sent' });
     sentAlerts.add(dedupeKey);
@@ -377,6 +393,14 @@ const SCAN = {
   minOdds: parseFloat(process.env.MIN_ODDS || '1.30'),
   maxOdds: parseFloat(process.env.MAX_ODDS || '2.50'),
   bankroll: parseFloat(process.env.BANKROLL || '100'),
+  // ── TELEGRAM = BEST OF THE BEST ONLY ──
+  // Phone alerts fire only for the most reliable, genuinely low-scoring setups.
+  // The on-screen bot still shows everything that passes the normal filters.
+  tgMinScore: parseInt(process.env.TG_MIN_SCORE || '82', 10),     // 82 = Grade A only
+  tgRequireEdge: (process.env.TG_REQUIRE_EDGE || 'true') === 'true',
+  tgMaxH2hAvg: parseFloat(process.env.TG_MAX_H2H_AVG || '2.3'),   // H2H must be low-scoring
+  tgMaxTeamAvg: parseFloat(process.env.TG_MAX_TEAM_AVG || '1.4'), // each team low-scoring
+  tgMinH2hCount: parseInt(process.env.TG_MIN_H2H || '3', 10),     // need real history
 };
 
 function catHour() {
@@ -441,10 +465,11 @@ function evaluate(g, r) {
     console.log(`VETO ${g.home} v ${g.away}: xG ${combinedXG} too high`);
     return null;
   }
-  // 5. Thin H2H sample → require real meetings, don't bet on assumptions
-  //    (only enforced when we have NO live data to lean on instead)
-  if (h2hCount < 3 && !(r.live && r.live.hasAnyLiveData)) {
-    console.log(`VETO ${g.home} v ${g.away}: only ${h2hCount} H2H meetings, no live data`);
+  // 5. Thin H2H sample → require real meetings. Don't bet on a near-empty history.
+  //    Exception only if we have FULL live stats (real shots/attacks) to read the
+  //    game directly — events-only data is NOT enough to override thin history.
+  if (h2hCount < 3 && !(r.live && r.live.available)) {
+    console.log(`VETO ${g.home} v ${g.away}: only ${h2hCount} H2H meetings, no full live stats`);
     return null;
   }
 
@@ -456,9 +481,19 @@ function evaluate(g, r) {
   const h2hR = total<=1?(r.h2h?.u25Rate||.5):total<=2?(r.h2h?.u35Rate||.6):(r.h2h?.u45Rate||.72);
   const blend = mp*.55 + h2hR*.45;
   const bp = realOdds ? 1/realOdds : 1/ob;
-  const edge = +((blend-bp)*100).toFixed(1);
+  const rawEdge = +((blend-bp)*100).toFixed(1);
+  // Sanity: a genuine edge above ~15% essentially never exists on a real market.
+  // If the model claims more, it's almost certainly wrong, not gold — cap it and
+  // refuse to treat it as a strong signal.
+  const edge = Math.min(rawEdge, 15);
+  const edgeSuspicious = rawEdge > 15;
   const hasEdge = edge >= SCAN.minEdge;
   if (realOdds && !hasEdge) return null;
+  // Don't bet on an implausible edge with thin history — that's model error.
+  if (edgeSuspicious && (r.h2h?.total || 0) < 4 && !(r.live && r.live.available)) {
+    console.log(`VETO ${g.home} v ${g.away}: implausible +${rawEdge}% edge on thin data`);
+    return null;
+  }
 
   let score = 65;
   if(h2hR>=.75)score+=14; else if(h2hR>=.55)score+=6; else score-=12;
@@ -545,7 +580,22 @@ function evaluate(g, r) {
     pressure: (lv && lv.hasAnyLiveData) ? lv.pressure : null,
     pressureSource: lv ? lv.pressureSource : 'none',
     reason,
+    // Numbers the Telegram best-of-best gate inspects:
+    h2hAvgGoals, h2hCount, homeFor, awayFor, combinedXG,
     kellyStake:kelly };
+}
+
+// Best-of-best gate — decides if a pick is reliable enough for a phone alert.
+// Far stricter than the on-screen bot: Grade A, low-scoring H2H, low-scoring
+// teams, real edge, and enough history to trust.
+function passesTelegramGate(ev, g) {
+  const tag = `${g.home} v ${g.away}`;
+  if (ev.score < SCAN.tgMinScore) { console.log(`TG-SKIP ${tag}: score ${ev.score} < ${SCAN.tgMinScore} (not Grade A)`); return false; }
+  if (SCAN.tgRequireEdge && !ev.hasEdge) { console.log(`TG-SKIP ${tag}: no real edge`); return false; }
+  if (ev.h2hCount < SCAN.tgMinH2hCount) { console.log(`TG-SKIP ${tag}: only ${ev.h2hCount} H2H meetings`); return false; }
+  if (ev.h2hAvgGoals !== null && ev.h2hAvgGoals > SCAN.tgMaxH2hAvg) { console.log(`TG-SKIP ${tag}: H2H avg ${ev.h2hAvgGoals} too high`); return false; }
+  if (ev.homeFor > SCAN.tgMaxTeamAvg || ev.awayFor > SCAN.tgMaxTeamAvg) { console.log(`TG-SKIP ${tag}: team scoring ${ev.homeFor}/${ev.awayFor} too high`); return false; }
+  return true;
 }
 
 async function autoScan() {
@@ -577,6 +627,10 @@ async function autoScan() {
       const r = await doResearch(f.teams.home.id, f.teams.away.id, f.league.id, f.fixture.id);
       const ev = evaluate(g, r);
       if (!ev) continue;
+
+      // ── BEST-OF-BEST GATE (Telegram only) ──
+      // Only the most reliable, genuinely low-scoring setups reach your phone.
+      if (!passesTelegramGate(ev, g)) continue;
 
       // Shared dedup with /notify — won't double-send if bot already alerted
       const dedupe = alertKey(g.id, ev.market);
