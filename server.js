@@ -1,6 +1,7 @@
 const express = require('express');
-const fetch = require('node-fetch');
 const cors = require('cors');
+// Using Node 18+ native fetch — avoids node-fetch v2 "Premature close" bug
+// with HTTP keep-alive connections (which API-Football uses)
 
 const app = express();
 const PORT = process.env.PORT || 3000;
