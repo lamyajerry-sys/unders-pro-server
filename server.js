@@ -47,7 +47,9 @@ function getCached(k, ttl) {
 function setCache(k, d) { cache.set(k, { data: d, ts: Date.now() }); }
 
 // Rate limiter — Pro plan allows 300/min. We cap at 250 for safety headroom.
-const RATE_MAX = parseInt(process.env.RATE_MAX || '250', 10);
+// Pro plan rate limit. API-Football throttles at ~30 req/min on Pro.
+// We set ours to 25 to stay safely under with buffer room.
+const RATE_MAX = parseInt(process.env.RATE_MAX || '25', 10);
 // ── Daily budget guard ──
 // Pro = 7500/day. Cap server auto-scanner at 6500, leaving ~1000 for manual.
 const DAILY_BUDGET = parseInt(process.env.DAILY_BUDGET || '6500', 10);
@@ -65,7 +67,7 @@ function budgetLeft() {
 }
 
 const times = [];
-async function call(endpoint, retries = 3) {
+async function call(endpoint) {
   const now = Date.now();
   while (times.length && now - times[0] > 60000) times.shift();
   if (times.length >= RATE_MAX) {
@@ -75,34 +77,14 @@ async function call(endpoint, retries = 3) {
   }
   times.push(Date.now());
   trackCall();
-
-  for (let attempt = 1; attempt <= retries; attempt++) {
-    try {
-      const res = await fetch(`https://${HOST}${endpoint}`, {
-        headers: { 'x-apisports-key': API_KEY },
-        // Timeout after 10s so premature-close doesn't hang forever
-        signal: AbortSignal.timeout(10000),
-      });
-      if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
-      const d = await res.json();
-      if (d.errors && Object.keys(d.errors).length) throw new Error(JSON.stringify(d.errors));
-      return d.response || [];
-    } catch(e) {
-      const transient = e.message.includes('Premature close') ||
-                        e.message.includes('network') ||
-                        e.message.includes('fetch') ||
-                        e.name === 'TimeoutError' ||
-                        e.code === 'ECONNRESET' ||
-                        e.code === 'ETIMEDOUT';
-      if (transient && attempt < retries) {
-        const delay = attempt * 2000; // 2s, then 4s
-        console.log(`Transient error (${e.message}) — retry ${attempt}/${retries} in ${delay}ms`);
-        await new Promise(r => setTimeout(r, delay));
-        continue;
-      }
-      throw e; // real error or out of retries
-    }
-  }
+  const res = await fetch(`https://${HOST}${endpoint}`, {
+    headers: { 'x-apisports-key': API_KEY },
+    signal: AbortSignal.timeout(10000),
+  });
+  if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
+  const d = await res.json();
+  if (d.errors && Object.keys(d.errors).length) throw new Error(JSON.stringify(d.errors));
+  return d.response || [];
 }
 
 app.get('/', (req, res) => res.json({ status: 'ok', message: 'Unders Pro — API-Football' }));
