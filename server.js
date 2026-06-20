@@ -64,7 +64,7 @@ function budgetLeft() {
 }
 
 const times = [];
-async function call(endpoint) {
+async function call(endpoint, retries = 3) {
   const now = Date.now();
   while (times.length && now - times[0] > 60000) times.shift();
   if (times.length >= RATE_MAX) {
@@ -74,13 +74,34 @@ async function call(endpoint) {
   }
   times.push(Date.now());
   trackCall();
-  const res = await fetch(`https://${HOST}${endpoint}`, {
-    headers: { 'x-apisports-key': API_KEY }
-  });
-  if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
-  const d = await res.json();
-  if (d.errors && Object.keys(d.errors).length) throw new Error(JSON.stringify(d.errors));
-  return d.response || [];
+
+  for (let attempt = 1; attempt <= retries; attempt++) {
+    try {
+      const res = await fetch(`https://${HOST}${endpoint}`, {
+        headers: { 'x-apisports-key': API_KEY },
+        // Timeout after 10s so premature-close doesn't hang forever
+        signal: AbortSignal.timeout(10000),
+      });
+      if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
+      const d = await res.json();
+      if (d.errors && Object.keys(d.errors).length) throw new Error(JSON.stringify(d.errors));
+      return d.response || [];
+    } catch(e) {
+      const transient = e.message.includes('Premature close') ||
+                        e.message.includes('network') ||
+                        e.message.includes('fetch') ||
+                        e.name === 'TimeoutError' ||
+                        e.code === 'ECONNRESET' ||
+                        e.code === 'ETIMEDOUT';
+      if (transient && attempt < retries) {
+        const delay = attempt * 2000; // 2s, then 4s
+        console.log(`Transient error (${e.message}) — retry ${attempt}/${retries} in ${delay}ms`);
+        await new Promise(r => setTimeout(r, delay));
+        continue;
+      }
+      throw e; // real error or out of retries
+    }
+  }
 }
 
 app.get('/', (req, res) => res.json({ status: 'ok', message: 'Unders Pro — API-Football' }));
@@ -495,7 +516,9 @@ function evaluate(g, r) {
     return null;
   }
 
-  let score = 65;
+  // Base 58 (was 65). Lower base means picks must EARN their score through real
+  // positives, so confidence spreads out honestly instead of pinning to the ceiling.
+  let score = 58;
   if(h2hR>=.75)score+=14; else if(h2hR>=.55)score+=6; else score-=12;
   const h2hAvg=r.h2h?.avgGoals||2.5;
   if(h2hAvg<=1.8)score+=11; else if(h2hAvg<=2.5)score+=4; else score-=9;
@@ -506,7 +529,7 @@ function evaluate(g, r) {
   if((r.away?.csRate||0)>=.30)score+=5;
   const xG=r.model?.xG||2.2;
   if(xG<=1.8)score+=9; else if(xG>=2.5)score-=12; else score+=3;
-  if(hasEdge)score+=11;
+  if(hasEdge)score+=7;
   if(r.model?.bothDefensive)score+=8;
 
   const lv=r.live;
@@ -531,7 +554,10 @@ function evaluate(g, r) {
   }
   if(tl<=20)score+=6;
   if(g.homeGoals!==g.awayGoals)score+=4;
-  score += lgAdj(g.leagueName);
+  // League adj — cap the positive boost at +6 so a friendly league alone can't
+  // inflate a mediocre pick; penalties (negative) still apply in full.
+  const _lg = lgAdj(g.leagueName);
+  score += _lg > 6 ? 6 : _lg;
   score = Math.max(30, Math.min(97, score));
 
   if(score < SCAN.minScore) return null;
