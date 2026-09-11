@@ -683,6 +683,169 @@ app.get('/status', (req, res) => {
   });
 });
 
+// ════════════════════════════════════════════
+// DAILY ACCUMULATOR
+// Runs once when the scanner first starts each day.
+// Fetches today's fixtures, scores them pre-match,
+// picks the best combination (2.0–6.0 odds) and
+// sends to Telegram.
+// ════════════════════════════════════════════
+let accaSentToday = '';  // tracks which date acca was sent
+
+async function buildDailyAcca() {
+  const today = new Date().toISOString().split('T')[0];
+  if (accaSentToday === today) return;  // only once per day
+  accaSentToday = today;
+
+  console.log('Building daily accumulator...');
+  try {
+    const fixtures = await call(`/fixtures?date=${today}&status=NS`);
+    if (!fixtures.length) {
+      console.log('No upcoming fixtures for acca today');
+      return;
+    }
+
+    const season = new Date().getFullYear();
+    const scored = [];
+
+    // Score each fixture using pre-match analysis
+    for (const f of fixtures.slice(0, 20)) {
+      if (budgetLeft() < 200) break;
+      const homeId = f.teams?.home?.id;
+      const awayId = f.teams?.away?.id;
+      const leagueId = f.league?.id;
+      if (!homeId || !awayId || !leagueId) continue;
+
+      try {
+        // Sequential calls to respect rate limit
+        const h2hRaw  = await call(`/fixtures/headtohead?h2h=${homeId}-${awayId}&last=10`);
+        const homeSt  = await call(`/teams/statistics?team=${homeId}&league=${leagueId}&season=${season}`);
+        const awaySt  = await call(`/teams/statistics?team=${awayId}&league=${leagueId}&season=${season}`);
+
+        // H2H analysis
+        const h2h = h2hRaw.slice(0, 10);
+        const h2hTotal = h2h.length;
+        if (h2hTotal < 3) continue;  // need real history
+
+        const h2hAvg = +(h2h.reduce((s,g)=>s+(g.goals?.home||0)+(g.goals?.away||0),0)/h2hTotal).toFixed(2);
+        if (h2hAvg >= 2.8) continue;  // high-scoring H2H — skip
+
+        const u25 = h2h.filter(g=>(g.goals?.home||0)+(g.goals?.away||0)<2.5).length;
+        const u25Rate = +(u25/h2hTotal).toFixed(2);
+
+        // Team stats
+        const hSt = homeSt[0] || {};
+        const aSt = awaySt[0] || {};
+        const homeFor = parseFloat(hSt.goals?.for?.average?.home || 1.3);
+        const awayFor = parseFloat(aSt.goals?.for?.average?.away || 1.1);
+
+        // Hard vetoes — same as live
+        if (homeFor >= 2.0 || awayFor >= 2.0) continue;
+        if ((homeFor + awayFor) >= 3.2) continue;
+
+        const xG = +(homeFor + awayFor).toFixed(2);
+        if (xG >= 2.8) continue;
+
+        // Score the fixture
+        let score = 50;
+        if (u25Rate >= 0.70) score += 14;
+        else if (u25Rate >= 0.55) score += 6;
+        else score -= 10;
+        if (h2hAvg <= 1.8) score += 11;
+        else if (h2hAvg <= 2.3) score += 5;
+        else score -= 7;
+        if (homeFor <= 1.0) score += 8;
+        if (awayFor <= 0.9) score += 8;
+        if (xG <= 1.8) score += 9;
+        const _lg = lgAdj(f.league?.name || '');
+        score += _lg > 6 ? 6 : _lg;
+        score = Math.max(20, Math.min(95, score));
+
+        if (score < 62) continue;  // only strong pre-match picks
+
+        // Estimated pre-match odds for Under 2.5
+        const estOdds = +(1.50 + (1 - u25Rate) * 0.8).toFixed(2);
+        if (estOdds < 1.30 || estOdds > 2.50) continue;
+
+        const ko = new Date(f.fixture?.date);
+        const koStr = ko.toLocaleTimeString([], { hour:'2-digit', minute:'2-digit' });
+
+        scored.push({
+          home: f.teams?.home?.name,
+          away: f.teams?.away?.name,
+          league: f.league?.name || '',
+          ko: koStr,
+          market: 'Under 2.5',
+          odds: estOdds,
+          score,
+          h2hAvg,
+          u25Rate,
+          xG,
+        });
+      } catch(e) {
+        // Skip fixture on error, continue with next
+        continue;
+      }
+    }
+
+    if (scored.length < 2) {
+      await sendTelegram(
+        `📅 <b>DAILY ACCUMULATOR — ${today}</b>\n\n` +
+        `⚠️ Not enough qualifying fixtures today.\n` +
+        `<i>All matches checked — none met the low-scoring criteria.</i>`
+      );
+      return;
+    }
+
+    // Sort by score, pick the best
+    scored.sort((a, b) => b.score - a.score);
+
+    // Build best acca within 2.0–6.0 combined odds
+    let legs = [];
+    let combined = 1;
+    for (const pick of scored) {
+      const newCombined = +(combined * pick.odds).toFixed(3);
+      if (newCombined > 6.0) break;
+      legs.push(pick);
+      combined = newCombined;
+      if (legs.length >= 5) break;
+    }
+
+    // Need at least 2 legs and combined >= 2.0
+    if (legs.length < 2 || combined < 2.0) {
+      // Try with more legs
+      legs = scored.slice(0, Math.min(4, scored.length));
+      combined = +legs.reduce((a, l) => a * l.odds, 1).toFixed(3);
+    }
+
+    if (legs.length < 2) {
+      await sendTelegram(`📅 <b>DAILY ACCUMULATOR — ${today}</b>\n\n⚠️ Not enough legs for acca today.`);
+      return;
+    }
+
+    const legLines = legs.map((l, i) =>
+      `${i+1}. <b>${l.home} vs ${l.away}</b>\n` +
+      `   ⬇ ${l.market} @ <b>${l.odds}</b>\n` +
+      `   🕐 ${l.ko} | H2H avg ${l.h2hAvg}g | xG ${l.xG}`
+    ).join('\n\n');
+
+    const msg =
+      `📅 <b>DAILY ACCUMULATOR — ${today}</b>\n` +
+      `⬇ TODAY'S BEST UNDER ACCA\n\n` +
+      legLines + '\n\n' +
+      `━━━━━━━━━━━━━━━\n` +
+      `💰 Combined odds: <b>${combined}</b>\n` +
+      `📊 ${legs.length} legs | All low-scoring H2H\n` +
+      `⚠️ <i>Pre-match only. Place before kickoff.</i>`;
+
+    await sendTelegram(msg);
+    console.log(`Daily acca sent: ${legs.length} legs @ ${combined}`);
+
+  } catch(e) {
+    console.error('Acca error:', e.message);
+  }
+}
+
 app.listen(PORT, () => {
   console.log(`✅ Unders Pro Server on port ${PORT}`);
   console.log(`🔑 Key: ${API_KEY ? API_KEY.slice(0,8)+'...' : 'NOT SET'}`);
@@ -692,7 +855,16 @@ app.listen(PORT, () => {
   // Adaptive scan loop: every 60s in active hours, checks budget itself
   if (SCAN.enabled) {
     setInterval(autoScan, 60000);
-    // Keep-alive ping to stop Render free tier sleeping during active hours
+    // Build daily acca once at startup if in active hours
+    if (inActiveHours()) {
+      setTimeout(buildDailyAcca, 10000); // 10s after boot so server is ready
+    }
+    // Also check at the start of each active hour in case server was off at start time
+    setInterval(() => {
+      const h = catHour();
+      if (h === SCAN.startHour) buildDailyAcca();
+    }, 60 * 60000); // check every hour
+    // Keep-alive ping
     setInterval(() => {
       if (inActiveHours()) console.log(`Heartbeat | CAT ${catHour()}:00 | budget ${budgetLeft()}`);
     }, 5 * 60000);
