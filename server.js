@@ -612,6 +612,11 @@ async function autoScan() {
   if (!inActiveHours()) return;
   if (budgetLeft() < 100) { console.log('Budget nearly exhausted, skipping scan'); return; }
 
+  // Fire daily acca once per day — checked every scan so it never misses
+  if (accaSentToday !== catDateStr() && budgetLeft() > 300) {
+    buildDailyAcca();  // runs async, doesn't block live scan
+  }
+
   try {
     const live = await call('/fixtures?live=all');
     const inWindow = live.filter(f => {
@@ -690,14 +695,21 @@ app.get('/status', (req, res) => {
 // picks the best combination (2.0–6.0 odds) and
 // sends to Telegram.
 // ════════════════════════════════════════════
-let accaSentToday = '';  // tracks which date acca was sent
+let accaSentToday = '';  // tracks which CAT date acca was sent
+
+function catDateStr() {
+  // Get today's date in CAT (UTC+2) as YYYY-MM-DD
+  const now = new Date();
+  const cat = new Date(now.getTime() + SCAN.tzOffset * 60 * 60 * 1000);
+  return cat.toISOString().split('T')[0];
+}
 
 async function buildDailyAcca() {
-  const today = new Date().toISOString().split('T')[0];
+  const today = catDateStr();
   if (accaSentToday === today) return;  // only once per day
   accaSentToday = today;
 
-  console.log('Building daily accumulator...');
+  console.log('Building daily accumulator for', today);
   try {
     const fixtures = await call(`/fixtures?date=${today}&status=NS`);
     if (!fixtures.length) {
@@ -855,15 +867,6 @@ app.listen(PORT, () => {
   // Adaptive scan loop: every 60s in active hours, checks budget itself
   if (SCAN.enabled) {
     setInterval(autoScan, 60000);
-    // Build daily acca once at startup if in active hours
-    if (inActiveHours()) {
-      setTimeout(buildDailyAcca, 10000); // 10s after boot so server is ready
-    }
-    // Also check at the start of each active hour in case server was off at start time
-    setInterval(() => {
-      const h = catHour();
-      if (h === SCAN.startHour) buildDailyAcca();
-    }, 60 * 60000); // check every hour
     // Keep-alive ping
     setInterval(() => {
       if (inActiveHours()) console.log(`Heartbeat | CAT ${catHour()}:00 | budget ${budgetLeft()}`);
