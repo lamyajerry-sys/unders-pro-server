@@ -717,87 +717,116 @@ async function buildDailyAcca() {
       return;
     }
 
+    const now = Date.now();
     const season = new Date().getFullYear();
     const scored = [];
 
-    // Score each fixture using pre-match analysis
-    for (const f of fixtures.slice(0, 20)) {
+    // Words that indicate youth, reserve or B-team games — skip these
+    const SKIP_WORDS = ['U19','U18','U17','U16','U15','U23','U21','U20',
+                        ' II',' B ',' B-',' III','Reserve','Youth','Under-','Reserva'];
+
+    for (const f of fixtures.slice(0, 25)) {
       if (budgetLeft() < 200) break;
+
+      const homeName = f.teams?.home?.name || '';
+      const awayName = f.teams?.away?.name || '';
+      const leagueName = f.league?.name || '';
+
+      // Skip youth / reserve / B-team games
+      const isYouth = SKIP_WORDS.some(w =>
+        homeName.includes(w) || awayName.includes(w) || leagueName.includes(w)
+      );
+      if (isYouth) { console.log(`ACCA-SKIP youth/reserve: ${homeName} vs ${awayName}`); continue; }
+
+      // Skip games kicking off in less than 45 minutes — need time to place bet
+      const ko = new Date(f.fixture?.date);
+      const minsUntilKo = (ko.getTime() - now) / 60000;
+      if (minsUntilKo < 45) { console.log(`ACCA-SKIP too soon (${Math.round(minsUntilKo)}m): ${homeName} vs ${awayName}`); continue; }
+
       const homeId = f.teams?.home?.id;
       const awayId = f.teams?.away?.id;
       const leagueId = f.league?.id;
       if (!homeId || !awayId || !leagueId) continue;
 
       try {
-        // Sequential calls to respect rate limit
-        const h2hRaw  = await call(`/fixtures/headtohead?h2h=${homeId}-${awayId}&last=10`);
-        const homeSt  = await call(`/teams/statistics?team=${homeId}&league=${leagueId}&season=${season}`);
-        const awaySt  = await call(`/teams/statistics?team=${awayId}&league=${leagueId}&season=${season}`);
+        const h2hRaw = await call(`/fixtures/headtohead?h2h=${homeId}-${awayId}&last=10`);
+        const homeSt = await call(`/teams/statistics?team=${homeId}&league=${leagueId}&season=${season}`);
+        const awaySt = await call(`/teams/statistics?team=${awayId}&league=${leagueId}&season=${season}`);
 
-        // H2H analysis
+        // H2H — need at least 3 real meetings
         const h2h = h2hRaw.slice(0, 10);
         const h2hTotal = h2h.length;
-        if (h2hTotal < 3) continue;  // need real history
+        if (h2hTotal < 3) { console.log(`ACCA-SKIP thin H2H (${h2hTotal}): ${homeName}`); continue; }
 
-        const h2hAvg = +(h2h.reduce((s,g)=>s+(g.goals?.home||0)+(g.goals?.away||0),0)/h2hTotal).toFixed(2);
-        if (h2hAvg >= 2.8) continue;  // high-scoring H2H — skip
+        const h2hGoals = h2h.map(g => (g.goals?.home||0)+(g.goals?.away||0));
+        const h2hAvg = +(h2hGoals.reduce((a,b)=>a+b,0)/h2hTotal).toFixed(2);
+        if (h2hAvg >= 2.8) { console.log(`ACCA-SKIP H2H avg ${h2hAvg}: ${homeName}`); continue; }
 
         const u25 = h2h.filter(g=>(g.goals?.home||0)+(g.goals?.away||0)<2.5).length;
+        const u35 = h2h.filter(g=>(g.goals?.home||0)+(g.goals?.away||0)<3.5).length;
         const u25Rate = +(u25/h2hTotal).toFixed(2);
+        const u35Rate = +(u35/h2hTotal).toFixed(2);
 
-        // Team stats
+        // Team stats — check we got REAL data not fallback defaults
         const hSt = homeSt[0] || {};
         const aSt = awaySt[0] || {};
-        const homeFor = parseFloat(hSt.goals?.for?.average?.home || 1.3);
-        const awayFor = parseFloat(aSt.goals?.for?.average?.away || 1.1);
+        const homeFor = parseFloat(hSt.goals?.for?.average?.home || 0);
+        const awayFor = parseFloat(aSt.goals?.for?.average?.away || 0);
 
-        // Hard vetoes — same as live
+        // If either team stat is missing (0 = not found), skip — no fake xG
+        if (homeFor === 0 || awayFor === 0) {
+          console.log(`ACCA-SKIP no real team stats: ${homeName} vs ${awayName}`);
+          continue;
+        }
+
+        // Hard vetoes
         if (homeFor >= 2.0 || awayFor >= 2.0) continue;
         if ((homeFor + awayFor) >= 3.2) continue;
 
         const xG = +(homeFor + awayFor).toFixed(2);
         if (xG >= 2.8) continue;
 
-        // Score the fixture
+        // Pick best market: U2.5 for very low-scoring H2H, U3.5 for moderate
+        // U3.5 gives better value (higher odds) when U2.5 is too tight
+        let market, odds;
+        if (u25Rate >= 0.60 && h2hAvg <= 2.0) {
+          market = 'Under 2.5';
+          odds = +(1.50 + (1 - u25Rate) * 0.8).toFixed(2);
+        } else if (u35Rate >= 0.65 && h2hAvg <= 2.6) {
+          market = 'Under 3.5';
+          odds = +(1.30 + (1 - u35Rate) * 0.7).toFixed(2);
+        } else {
+          console.log(`ACCA-SKIP no good market: ${homeName} u25=${u25Rate} u35=${u35Rate}`);
+          continue;
+        }
+
+        if (odds < 1.30 || odds > 2.50) continue;
+
+        // Score
         let score = 50;
-        if (u25Rate >= 0.70) score += 14;
-        else if (u25Rate >= 0.55) score += 6;
-        else score -= 10;
-        if (h2hAvg <= 1.8) score += 11;
-        else if (h2hAvg <= 2.3) score += 5;
-        else score -= 7;
+        if (u25Rate >= 0.70) score += 14; else if (u25Rate >= 0.55) score += 6; else score -= 6;
+        if (h2hAvg <= 1.8) score += 11; else if (h2hAvg <= 2.3) score += 5; else score -= 5;
         if (homeFor <= 1.0) score += 8;
         if (awayFor <= 0.9) score += 8;
         if (xG <= 1.8) score += 9;
-        const _lg = lgAdj(f.league?.name || '');
+        const _lg = lgAdj(leagueName);
         score += _lg > 6 ? 6 : _lg;
         score = Math.max(20, Math.min(95, score));
 
-        if (score < 62) continue;  // only strong pre-match picks
+        if (score < 62) continue;
 
-        // Estimated pre-match odds for Under 2.5
-        const estOdds = +(1.50 + (1 - u25Rate) * 0.8).toFixed(2);
-        if (estOdds < 1.30 || estOdds > 2.50) continue;
-
-        const ko = new Date(f.fixture?.date);
         const koStr = ko.toLocaleTimeString([], { hour:'2-digit', minute:'2-digit' });
+        const minsStr = minsUntilKo < 60
+          ? `${Math.round(minsUntilKo)}m`
+          : `${Math.floor(minsUntilKo/60)}h${Math.round(minsUntilKo%60)}m`;
 
         scored.push({
-          home: f.teams?.home?.name,
-          away: f.teams?.away?.name,
-          league: f.league?.name || '',
-          ko: koStr,
-          market: 'Under 2.5',
-          odds: estOdds,
-          score,
-          h2hAvg,
-          u25Rate,
-          xG,
+          home: homeName, away: awayName,
+          league: leagueName, ko: koStr, minsUntil: minsStr,
+          market, odds, score, h2hAvg, h2hTotal, u25Rate, u35Rate, xG,
         });
-      } catch(e) {
-        // Skip fixture on error, continue with next
-        continue;
-      }
+
+      } catch(e) { continue; }
     }
 
     if (scored.length < 2) {
@@ -809,25 +838,15 @@ async function buildDailyAcca() {
       return;
     }
 
-    // Sort by score, pick the best
+    // Sort by score, build best acca within 2.0–6.0
     scored.sort((a, b) => b.score - a.score);
-
-    // Build best acca within 2.0–6.0 combined odds
-    let legs = [];
-    let combined = 1;
+    let legs = [], combined = 1;
     for (const pick of scored) {
-      const newCombined = +(combined * pick.odds).toFixed(3);
-      if (newCombined > 6.0) break;
+      const next = +(combined * pick.odds).toFixed(3);
+      if (next > 6.0) continue; // try next pick instead of breaking
       legs.push(pick);
-      combined = newCombined;
+      combined = next;
       if (legs.length >= 5) break;
-    }
-
-    // Need at least 2 legs and combined >= 2.0
-    if (legs.length < 2 || combined < 2.0) {
-      // Try with more legs
-      legs = scored.slice(0, Math.min(4, scored.length));
-      combined = +legs.reduce((a, l) => a * l.odds, 1).toFixed(3);
     }
 
     if (legs.length < 2) {
@@ -835,10 +854,12 @@ async function buildDailyAcca() {
       return;
     }
 
+    combined = +legs.reduce((a,l)=>a*l.odds,1).toFixed(3);
+
     const legLines = legs.map((l, i) =>
       `${i+1}. <b>${l.home} vs ${l.away}</b>\n` +
       `   ⬇ ${l.market} @ <b>${l.odds}</b>\n` +
-      `   🕐 ${l.ko} | H2H avg ${l.h2hAvg}g | xG ${l.xG}`
+      `   🕐 ${l.ko} (in ${l.minsUntil}) | H2H ${l.h2hTotal}g avg ${l.h2hAvg} | xG ${l.xG}`
     ).join('\n\n');
 
     const msg =
@@ -847,7 +868,7 @@ async function buildDailyAcca() {
       legLines + '\n\n' +
       `━━━━━━━━━━━━━━━\n` +
       `💰 Combined odds: <b>${combined}</b>\n` +
-      `📊 ${legs.length} legs | All low-scoring H2H\n` +
+      `📊 ${legs.length} legs | Low-scoring H2H | Real stats verified\n` +
       `⚠️ <i>Pre-match only. Place before kickoff.</i>`;
 
     await sendTelegram(msg);
