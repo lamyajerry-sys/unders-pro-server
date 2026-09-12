@@ -612,11 +612,6 @@ async function autoScan() {
   if (!inActiveHours()) return;
   if (budgetLeft() < 100) { console.log('Budget nearly exhausted, skipping scan'); return; }
 
-  // Fire daily acca once per day — checked every scan so it never misses
-  if (accaSentToday !== catDateStr() && budgetLeft() > 300) {
-    buildDailyAcca();  // runs async, doesn't block live scan
-  }
-
   try {
     const live = await call('/fixtures?live=all');
     const inWindow = live.filter(f => {
@@ -627,8 +622,11 @@ async function autoScan() {
 
     if (inWindow.length) console.log(`AutoScan: ${inWindow.length} in window | budget left: ${budgetLeft()}`);
 
+    // Collect all qualifying picks this scan for live acca
+    const scanPicks = [];
+
     for (const f of inWindow) {
-      if (budgetLeft() < 50) break;  // hard stop near budget limit
+      if (budgetLeft() < 50) break;
       const g = {
         id: f.fixture.id,
         home: f.teams.home.name, away: f.teams.away.name,
@@ -642,34 +640,80 @@ async function autoScan() {
       const ev = evaluate(g, r);
       if (!ev) continue;
 
-      // ── BEST-OF-BEST GATE (Telegram only) ──
-      // Only the most reliable, genuinely low-scoring setups reach your phone.
       if (!passesTelegramGate(ev, g)) continue;
 
-      // Shared dedup with /notify — won't double-send if bot already alerted
+      // Send individual single alert (deduped)
       const dedupe = alertKey(g.id, ev.market);
-      if (sentAlerts.has(dedupe)) continue;
-      sentAlerts.add(dedupe);
-      if (sentAlerts.size > 300) sentAlerts.clear();
+      if (!sentAlerts.has(dedupe)) {
+        sentAlerts.add(dedupe);
+        if (sentAlerts.size > 300) sentAlerts.clear();
 
-      const edgeLine = ev.edge ? `\n📊 Edge: <b>+${ev.edge}%</b>` : '';
-      const pressLine = ev.pressureSource === 'full'
-        ? `\n⚡ Live pressure: <b>${ev.pressure}/100</b>`
-        : ev.pressureSource === 'events'
-        ? `\n⚡ Live pressure: <b>${ev.pressure}/100</b> (events only — no full stats)`
-        : `\n⚠️ No live data — pre-match analysis only`;
-      const kellyLine = ev.kellyStake ? `\n💰 Stake: <b>$${ev.kellyStake}</b>` : '';
-      await sendTelegram(
-        `🎯 <b>AUTO PICK — Grade ${ev.grade}</b>\n\n` +
-        `<b>${g.home} vs ${g.away}</b>\n${g.league}\n` +
-        `⏱ ${g.minute}' | Score ${g.homeGoals}:${g.awayGoals}\n\n` +
-        `⬇ <b>${ev.market}</b> @ <b>${ev.odds}</b>\n` +
-        `💡 <b>Why:</b> ${ev.reason}\n` +
-        `Confidence: <b>${ev.score}%</b>${edgeLine}${pressLine}${kellyLine}\n\n` +
-        `<i>Always 2 goals to bust. Place manually.</i>`
-      );
-      console.log(`AUTO ALERT: ${g.home} vs ${g.away} | ${ev.market} @ ${ev.odds} | ${ev.score}%`);
+        const edgeLine = ev.edge ? `\n📊 Edge: <b>+${ev.edge}%</b>` : '';
+        const pressLine = ev.pressureSource === 'full'
+          ? `\n⚡ Live pressure: <b>${ev.pressure}/100</b>`
+          : ev.pressureSource === 'events'
+          ? `\n⚡ Live pressure: <b>${ev.pressure}/100</b> (events only — no full stats)`
+          : `\n⚠️ No live data — pre-match analysis only`;
+        const kellyLine = ev.kellyStake ? `\n💰 Stake: <b>$${ev.kellyStake}</b>` : '';
+        await sendTelegram(
+          `🎯 <b>AUTO PICK — Grade ${ev.grade}</b>\n\n` +
+          `<b>${g.home} vs ${g.away}</b>\n${g.league}\n` +
+          `⏱ ${g.minute}' | Score ${g.homeGoals}:${g.awayGoals}\n\n` +
+          `⬇ <b>${ev.market}</b> @ <b>${ev.odds}</b>\n` +
+          `💡 <b>Why:</b> ${ev.reason}\n` +
+          `Confidence: <b>${ev.score}%</b>${edgeLine}${pressLine}${kellyLine}\n\n` +
+          `<i>Always 2 goals to bust. Place manually.</i>`
+        );
+        console.log(`AUTO ALERT: ${g.home} vs ${g.away} | ${ev.market} @ ${ev.odds} | ${ev.score}%`);
+      }
+
+      // Collect for live acca (include even if already alerted as single)
+      scanPicks.push({ g, ev });
     }
+
+    // ── LIVE ACCA — build if 2+ picks from different leagues ──
+    if (scanPicks.length >= 2) {
+      // Only combine legs from different leagues (independence rule)
+      const accaLegs = [];
+      const usedLeagues = new Set();
+      // Sort by score descending — best picks first
+      const sorted = [...scanPicks].sort((a,b) => b.ev.score - a.ev.score);
+      for (const { g, ev } of sorted) {
+        if (usedLeagues.has(g.leagueName)) continue;
+        accaLegs.push({ g, ev });
+        usedLeagues.add(g.leagueName);
+        if (accaLegs.length >= 4) break;
+      }
+
+      if (accaLegs.length >= 2) {
+        const combined = +accaLegs.reduce((a, l) => a * l.ev.odds, 1).toFixed(3);
+        // Only send if combined odds in 1.80–6.0 range
+        if (combined >= 1.80 && combined <= 6.0) {
+          // Dedup the acca itself — key by sorted fixture IDs
+          const accaKey = 'acca_' + accaLegs.map(l=>l.g.id).sort().join('_');
+          if (!sentAlerts.has(accaKey)) {
+            sentAlerts.add(accaKey);
+
+            const legLines = accaLegs.map((l, i) =>
+              `${i+1}. <b>${l.g.home} vs ${l.g.away}</b>\n` +
+              `   ⬇ ${l.ev.market} @ <b>${l.ev.odds}</b>\n` +
+              `   ⏱ ${l.g.minute}' | Score ${l.g.homeGoals}:${l.g.awayGoals} | ${l.ev.score}%`
+            ).join('\n\n');
+
+            await sendTelegram(
+              `🔗 <b>LIVE ACCA — ${accaLegs.length} LEGS</b>\n\n` +
+              legLines + '\n\n' +
+              `━━━━━━━━━━━━━━━\n` +
+              `💰 Combined odds: <b>${combined}</b>\n` +
+              `📊 Independent legs (different leagues)\n` +
+              `<i>Always 2 goals to bust each leg. Place manually.</i>`
+            );
+            console.log(`LIVE ACCA: ${accaLegs.length} legs @ ${combined}`);
+          }
+        }
+      }
+    }
+
   } catch(e) {
     console.error('AutoScan error:', e.message);
   }
@@ -687,198 +731,6 @@ app.get('/status', (req, res) => {
     dailyBudget: DAILY_BUDGET,
   });
 });
-
-// ════════════════════════════════════════════
-// DAILY ACCUMULATOR
-// Runs once when the scanner first starts each day.
-// Fetches today's fixtures, scores them pre-match,
-// picks the best combination (2.0–6.0 odds) and
-// sends to Telegram.
-// ════════════════════════════════════════════
-let accaSentToday = '';  // tracks which CAT date acca was sent
-
-function catDateStr() {
-  // Get today's date in CAT (UTC+2) as YYYY-MM-DD
-  const now = new Date();
-  const cat = new Date(now.getTime() + SCAN.tzOffset * 60 * 60 * 1000);
-  return cat.toISOString().split('T')[0];
-}
-
-async function buildDailyAcca() {
-  const today = catDateStr();
-  if (accaSentToday === today) return;  // only once per day
-  accaSentToday = today;
-
-  console.log('Building daily accumulator for', today);
-  try {
-    const fixtures = await call(`/fixtures?date=${today}&status=NS`);
-    if (!fixtures.length) {
-      console.log('No upcoming fixtures for acca today');
-      return;
-    }
-
-    const now = Date.now();
-    const season = new Date().getFullYear();
-    const scored = [];
-
-    // Words that indicate youth, reserve or B-team games — skip these
-    const SKIP_WORDS = ['U19','U18','U17','U16','U15','U23','U21','U20',
-                        ' II',' B ',' B-',' III','Reserve','Youth','Under-','Reserva'];
-
-    for (const f of fixtures.slice(0, 25)) {
-      if (budgetLeft() < 200) break;
-
-      const homeName = f.teams?.home?.name || '';
-      const awayName = f.teams?.away?.name || '';
-      const leagueName = f.league?.name || '';
-
-      // Skip youth / reserve / B-team games
-      const isYouth = SKIP_WORDS.some(w =>
-        homeName.includes(w) || awayName.includes(w) || leagueName.includes(w)
-      );
-      if (isYouth) { console.log(`ACCA-SKIP youth/reserve: ${homeName} vs ${awayName}`); continue; }
-
-      // Skip games kicking off in less than 45 minutes — need time to place bet
-      const ko = new Date(f.fixture?.date);
-      const minsUntilKo = (ko.getTime() - now) / 60000;
-      if (minsUntilKo < 45) { console.log(`ACCA-SKIP too soon (${Math.round(minsUntilKo)}m): ${homeName} vs ${awayName}`); continue; }
-
-      const homeId = f.teams?.home?.id;
-      const awayId = f.teams?.away?.id;
-      const leagueId = f.league?.id;
-      if (!homeId || !awayId || !leagueId) continue;
-
-      try {
-        const h2hRaw = await call(`/fixtures/headtohead?h2h=${homeId}-${awayId}&last=10`);
-        const homeSt = await call(`/teams/statistics?team=${homeId}&league=${leagueId}&season=${season}`);
-        const awaySt = await call(`/teams/statistics?team=${awayId}&league=${leagueId}&season=${season}`);
-
-        // H2H — need at least 3 real meetings
-        const h2h = h2hRaw.slice(0, 10);
-        const h2hTotal = h2h.length;
-        if (h2hTotal < 3) { console.log(`ACCA-SKIP thin H2H (${h2hTotal}): ${homeName}`); continue; }
-
-        const h2hGoals = h2h.map(g => (g.goals?.home||0)+(g.goals?.away||0));
-        const h2hAvg = +(h2hGoals.reduce((a,b)=>a+b,0)/h2hTotal).toFixed(2);
-        if (h2hAvg >= 2.8) { console.log(`ACCA-SKIP H2H avg ${h2hAvg}: ${homeName}`); continue; }
-
-        const u25 = h2h.filter(g=>(g.goals?.home||0)+(g.goals?.away||0)<2.5).length;
-        const u35 = h2h.filter(g=>(g.goals?.home||0)+(g.goals?.away||0)<3.5).length;
-        const u25Rate = +(u25/h2hTotal).toFixed(2);
-        const u35Rate = +(u35/h2hTotal).toFixed(2);
-
-        // Team stats — check we got REAL data not fallback defaults
-        const hSt = homeSt[0] || {};
-        const aSt = awaySt[0] || {};
-        const homeFor = parseFloat(hSt.goals?.for?.average?.home || 0);
-        const awayFor = parseFloat(aSt.goals?.for?.average?.away || 0);
-
-        // If either team stat is missing (0 = not found), skip — no fake xG
-        if (homeFor === 0 || awayFor === 0) {
-          console.log(`ACCA-SKIP no real team stats: ${homeName} vs ${awayName}`);
-          continue;
-        }
-
-        // Hard vetoes
-        if (homeFor >= 2.0 || awayFor >= 2.0) continue;
-        if ((homeFor + awayFor) >= 3.2) continue;
-
-        const xG = +(homeFor + awayFor).toFixed(2);
-        if (xG >= 2.8) continue;
-
-        // Pick best market: U2.5 for very low-scoring H2H, U3.5 for moderate
-        // U3.5 gives better value (higher odds) when U2.5 is too tight
-        let market, odds;
-        if (u25Rate >= 0.60 && h2hAvg <= 2.0) {
-          market = 'Under 2.5';
-          odds = +(1.50 + (1 - u25Rate) * 0.8).toFixed(2);
-        } else if (u35Rate >= 0.65 && h2hAvg <= 2.6) {
-          market = 'Under 3.5';
-          odds = +(1.30 + (1 - u35Rate) * 0.7).toFixed(2);
-        } else {
-          console.log(`ACCA-SKIP no good market: ${homeName} u25=${u25Rate} u35=${u35Rate}`);
-          continue;
-        }
-
-        if (odds < 1.30 || odds > 2.50) continue;
-
-        // Score
-        let score = 50;
-        if (u25Rate >= 0.70) score += 14; else if (u25Rate >= 0.55) score += 6; else score -= 6;
-        if (h2hAvg <= 1.8) score += 11; else if (h2hAvg <= 2.3) score += 5; else score -= 5;
-        if (homeFor <= 1.0) score += 8;
-        if (awayFor <= 0.9) score += 8;
-        if (xG <= 1.8) score += 9;
-        const _lg = lgAdj(leagueName);
-        score += _lg > 6 ? 6 : _lg;
-        score = Math.max(20, Math.min(95, score));
-
-        if (score < 62) continue;
-
-        const koStr = ko.toLocaleTimeString([], { hour:'2-digit', minute:'2-digit' });
-        const minsStr = minsUntilKo < 60
-          ? `${Math.round(minsUntilKo)}m`
-          : `${Math.floor(minsUntilKo/60)}h${Math.round(minsUntilKo%60)}m`;
-
-        scored.push({
-          home: homeName, away: awayName,
-          league: leagueName, ko: koStr, minsUntil: minsStr,
-          market, odds, score, h2hAvg, h2hTotal, u25Rate, u35Rate, xG,
-        });
-
-      } catch(e) { continue; }
-    }
-
-    if (scored.length < 2) {
-      await sendTelegram(
-        `📅 <b>DAILY ACCUMULATOR — ${today}</b>\n\n` +
-        `⚠️ Not enough qualifying fixtures today.\n` +
-        `<i>All matches checked — none met the low-scoring criteria.</i>`
-      );
-      return;
-    }
-
-    // Sort by score, build best acca within 2.0–6.0
-    scored.sort((a, b) => b.score - a.score);
-    let legs = [], combined = 1;
-    for (const pick of scored) {
-      const next = +(combined * pick.odds).toFixed(3);
-      if (next > 6.0) continue; // try next pick instead of breaking
-      legs.push(pick);
-      combined = next;
-      if (legs.length >= 5) break;
-    }
-
-    if (legs.length < 2) {
-      await sendTelegram(`📅 <b>DAILY ACCUMULATOR — ${today}</b>\n\n⚠️ Not enough legs for acca today.`);
-      return;
-    }
-
-    combined = +legs.reduce((a,l)=>a*l.odds,1).toFixed(3);
-
-    const legLines = legs.map((l, i) =>
-      `${i+1}. <b>${l.home} vs ${l.away}</b>\n` +
-      `   ⬇ ${l.market} @ <b>${l.odds}</b>\n` +
-      `   🕐 ${l.ko} (in ${l.minsUntil}) | H2H ${l.h2hTotal}g avg ${l.h2hAvg} | xG ${l.xG}`
-    ).join('\n\n');
-
-    const msg =
-      `📅 <b>DAILY ACCUMULATOR — ${today}</b>\n` +
-      `⬇ TODAY'S BEST UNDER ACCA\n\n` +
-      legLines + '\n\n' +
-      `━━━━━━━━━━━━━━━\n` +
-      `💰 Combined odds: <b>${combined}</b>\n` +
-      `📊 ${legs.length} legs | Low-scoring H2H | Real stats verified\n` +
-      `⚠️ <i>Pre-match only. Place before kickoff.</i>`;
-
-    await sendTelegram(msg);
-    console.log(`Daily acca sent: ${legs.length} legs @ ${combined}`);
-
-  } catch(e) {
-    console.error('Acca error:', e.message);
-  }
-}
-
 app.listen(PORT, () => {
   console.log(`✅ Unders Pro Server on port ${PORT}`);
   console.log(`🔑 Key: ${API_KEY ? API_KEY.slice(0,8)+'...' : 'NOT SET'}`);
