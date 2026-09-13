@@ -682,6 +682,17 @@ async function autoScan() {
           `<i>Always 2 goals to bust. Place manually.</i>`
         );
         console.log(`AUTO ALERT: ${g.home} vs ${g.away} | ${ev.market} @ ${ev.odds} | ${ev.score}%`);
+
+        // Save to pending picks for auto result tracking
+        pendingPicks.push({
+          fixtureId: g.id,
+          home: g.home, away: g.away,
+          league: g.league,
+          market: ev.market,
+          odds: ev.odds,
+          alertedAt: Date.now(),
+          checkedAt: null,
+        });
       }
     }
 
@@ -731,6 +742,76 @@ async function autoScan() {
   }
 }
 
+// ════════════════════════════════════════════
+// AUTO RESULT TRACKER
+// Stores picks when alerted, checks final scores
+// every 15 mins and sends WIN/LOSS to Telegram.
+// ════════════════════════════════════════════
+const pendingPicks = [];
+
+async function checkResults() {
+  if (!pendingPicks.length) return;
+
+  // Only check picks alerted more than 20 mins ago (game still ongoing)
+  const toCheck = pendingPicks.filter(p =>
+    !p.checkedAt && (Date.now() - p.alertedAt) > 20 * 60 * 1000
+  );
+  if (!toCheck.length) return;
+
+  console.log(`Result checker: ${toCheck.length} picks to check`);
+
+  for (const pick of toCheck) {
+    if (budgetLeft() < 20) break;
+    try {
+      const fixtures = await call(`/fixtures?id=${pick.fixtureId}`);
+      const f = fixtures[0];
+      if (!f) continue;
+
+      const status = f.fixture?.status?.short;
+      // Only process finished games
+      if (!['FT','AET','PEN'].includes(status)) continue;
+
+      pick.checkedAt = Date.now();
+
+      const homeGoals = f.goals?.home ?? 0;
+      const awayGoals = f.goals?.away ?? 0;
+      const totalGoals = homeGoals + awayGoals;
+      const finalScore = `${homeGoals}:${awayGoals}`;
+
+      // Did the under hold?
+      const lineMap = {'Under 2.5':2.5,'Under 3.5':3.5,'Under 4.5':4.5,'Under 5.5':5.5,'Under 6.5':6.5};
+      const line = lineMap[pick.market] || 2.5;
+      const won = totalGoals < line;
+
+      const msg = won
+        ? `✅ <b>RESULT: WIN</b>\n\n` +
+          `<b>${pick.home} vs ${pick.away}</b>\n${pick.league}\n\n` +
+          `⬇ ${pick.market} — <b>HELD ✅</b>\n` +
+          `Final score: ${finalScore} (${totalGoals} goals)\n` +
+          `Odds taken: ${pick.odds}`
+        : `❌ <b>RESULT: LOSS</b>\n\n` +
+          `<b>${pick.home} vs ${pick.away}</b>\n${pick.league}\n\n` +
+          `⬇ ${pick.market} — <b>BUSTED ❌</b>\n` +
+          `Final score: ${finalScore} (${totalGoals} goals)\n` +
+          `Odds taken: ${pick.odds}`;
+
+      await sendTelegram(msg);
+      console.log(`RESULT: ${won?'WIN':'LOSS'} — ${pick.home} vs ${pick.away} | ${finalScore} | ${pick.market}`);
+
+    } catch(e) {
+      console.error(`Result check error for ${pick.fixtureId}:`, e.message);
+    }
+  }
+
+  // Clean up picks checked more than 3 hours ago
+  const cutoff = Date.now() - 3 * 60 * 60 * 1000;
+  const before = pendingPicks.length;
+  pendingPicks.splice(0, pendingPicks.length,
+    ...pendingPicks.filter(p => !p.checkedAt || p.checkedAt > cutoff)
+  );
+  if (pendingPicks.length < before) console.log(`Cleaned ${before - pendingPicks.length} old picks from tracker`);
+}
+
 // Status endpoint — check scanner state and budget
 app.get('/status', (req, res) => {
   res.json({
@@ -752,6 +833,8 @@ app.listen(PORT, () => {
   // Adaptive scan loop: every 60s in active hours, checks budget itself
   if (SCAN.enabled) {
     setInterval(autoScan, 60000);
+    // Check results every 15 minutes
+    setInterval(checkResults, 15 * 60000);
     // Keep-alive ping
     setInterval(() => {
       if (inActiveHours()) console.log(`Heartbeat | CAT ${catHour()}:00 | budget ${budgetLeft()}`);
