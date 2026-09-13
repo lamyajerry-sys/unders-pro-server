@@ -392,7 +392,7 @@ const SCAN = {
   startHour: parseInt(process.env.ACTIVE_START || '14', 10),  // CAT hours
   endHour: parseInt(process.env.ACTIVE_END || '23', 10),
   tzOffset: parseInt(process.env.TZ_OFFSET || '2', 10),       // CAT = UTC+2
-  minMin: 60, maxMin: 75,
+  minMin: 60, maxMin: 72,
   minScore: 55, minEdge: 3, maxPressure: 55,
   minOdds: parseFloat(process.env.MIN_ODDS || '1.30'),
   maxOdds: parseFloat(process.env.MAX_ODDS || '2.50'),
@@ -437,6 +437,14 @@ function evaluate(g, r) {
   const realOdds = r.liveOdds?.[market] || null;
   const finalOdds = realOdds ? +realOdds.toFixed(3) : Math.max(1.05, +(ob-(1-tl/30)*0.05).toFixed(3));
   if (finalOdds < SCAN.minOdds || finalOdds > SCAN.maxOdds) return null;
+
+  // Late-game odds check — past 68 minutes the bookmaker has already priced
+  // most of the value out. If odds are below 1.35 at that stage there's no
+  // real value left, just certainty the market has caught up to.
+  if (g.minute >= 68 && finalOdds < 1.35) {
+    console.log(`SKIP ${g.home} v ${g.away}: odds ${finalOdds} too low at ${g.minute}'`);
+    return null;
+  }
 
   // ════════════════════════════════════════════
   // HARD VETOES — absolute blocks on high-scoring situations.
@@ -622,8 +630,12 @@ async function autoScan() {
 
     if (inWindow.length) console.log(`AutoScan: ${inWindow.length} in window | budget left: ${budgetLeft()}`);
 
-    // Collect all qualifying picks this scan for live acca
-    const scanPicks = [];
+    // Two separate pools:
+    // singlesPool — must pass strict Grade A gate (what gets sent as singles)
+    // accaPool    — any pick that passed evaluate() with score >= 68 (Grade B+)
+    //               Acca uses wider pool since combining legs lowers probability anyway
+    const singlesPool = [];
+    const accaPool = [];
 
     for (const f of inWindow) {
       if (budgetLeft() < 50) break;
@@ -640,7 +652,12 @@ async function autoScan() {
       const ev = evaluate(g, r);
       if (!ev) continue;
 
+      // Grade B+ (score >= 68) qualifies for acca pool
+      if (ev.score >= 68) accaPool.push({ g, ev });
+
+      // Grade A gate for singles
       if (!passesTelegramGate(ev, g)) continue;
+      singlesPool.push({ g, ev });
 
       // Send individual single alert (deduped)
       const dedupe = alertKey(g.id, ev.market);
@@ -666,18 +683,14 @@ async function autoScan() {
         );
         console.log(`AUTO ALERT: ${g.home} vs ${g.away} | ${ev.market} @ ${ev.odds} | ${ev.score}%`);
       }
-
-      // Collect for live acca (include even if already alerted as single)
-      scanPicks.push({ g, ev });
     }
 
-    // ── LIVE ACCA — build if 2+ picks from different leagues ──
-    if (scanPicks.length >= 2) {
-      // Only combine legs from different leagues (independence rule)
+    // ── LIVE ACCA — build from accaPool (Grade B+), different leagues only ──
+    if (accaPool.length >= 2) {
       const accaLegs = [];
       const usedLeagues = new Set();
-      // Sort by score descending — best picks first
-      const sorted = [...scanPicks].sort((a,b) => b.ev.score - a.ev.score);
+      // Best score first
+      const sorted = [...accaPool].sort((a,b) => b.ev.score - a.ev.score);
       for (const { g, ev } of sorted) {
         if (usedLeagues.has(g.leagueName)) continue;
         accaLegs.push({ g, ev });
@@ -687,9 +700,8 @@ async function autoScan() {
 
       if (accaLegs.length >= 2) {
         const combined = +accaLegs.reduce((a, l) => a * l.ev.odds, 1).toFixed(3);
-        // Only send if combined odds in 1.80–6.0 range
-        if (combined >= 1.80 && combined <= 6.0) {
-          // Dedup the acca itself — key by sorted fixture IDs
+        // Combined odds 2.0–5.0 as requested
+        if (combined >= 2.0 && combined <= 5.0) {
           const accaKey = 'acca_' + accaLegs.map(l=>l.g.id).sort().join('_');
           if (!sentAlerts.has(accaKey)) {
             sentAlerts.add(accaKey);
