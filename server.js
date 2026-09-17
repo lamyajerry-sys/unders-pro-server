@@ -438,6 +438,14 @@ function evaluate(g, r) {
   const finalOdds = realOdds ? +realOdds.toFixed(3) : Math.max(1.05, +(ob-(1-tl/30)*0.05).toFixed(3));
   if (finalOdds < SCAN.minOdds || finalOdds > SCAN.maxOdds) return null;
 
+  // 0:0 past 65 minutes MUST have real bookmaker odds.
+  // Estimated odds for a late 0:0 are wildly inaccurate — the real odds
+  // are already 1.10-1.20 but the estimator shows 1.55. Skip if no real odds.
+  if (total === 0 && g.minute >= 65 && !realOdds) {
+    console.log(`SKIP ${g.home} v ${g.away}: 0:0 at ${g.minute}' — no real odds, estimated would be misleading`);
+    return null;
+  }
+
   // Late-game odds check — past 68 minutes the bookmaker has already priced
   // most of the value out. If odds are below 1.35 at that stage there's no
   // real value left, just certainty the market has caught up to.
